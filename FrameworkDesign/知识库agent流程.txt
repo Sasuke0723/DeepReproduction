@@ -4,7 +4,9 @@
 |-获取 https://api.osv.dev/v1/vulns/CVE-2022-28805（这是一个json文件）
 |
 |
-|-获取 id/details/published/affected
+|-获取 id/details/published/affected字段
+|
+|-获取源码-->将README、makefile等编译相关文件备份到知识库
 |
 |
 |-获取references字段--|-寻找type为 'FIX'的url--|-若为github&commit，则获取url+.patch文件
