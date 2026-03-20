@@ -1,16 +1,10 @@
-"""计划功能：定义网页抓取结果结构，保存原始页面内容和可继续跟踪的外链信息。"""
+"""文件说明：网页抓取结果模型。用于保存原始页面内容、清洗文本和基础元数据。"""
+
 from pydantic import BaseModel
-from typing import List
 
 
 class FetchedPage(BaseModel):
-
     url: str
-
     title: str
-
-    raw_html: str
-
-    raw_text: str
-
-    out_links: List[str]
+    html: str
+    cleaned_text: str
