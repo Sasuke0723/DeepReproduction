@@ -1,4 +1,4 @@
-# 文件说明：Python 项目配置文件。用于声明依赖、Python 版本和构建工具配置。
+﻿# 文件说明：Python 项目配置文件。用于声明依赖、Python 版本和构建工具配置。
 
 [project]
 name = "DeepReproduction"
@@ -7,12 +7,20 @@ description = "Vulnerability Reproduction Based on LLM Agents"
 authors = []
 dependencies = [
     "langchain==0.1.0",
+    "langgraph>=0.0.26",
+    "pydantic>=1.10.13,<3",
+    "PyYAML>=6.0",
     "python-dotenv>=1.0.1",
     "langchain-openai>=0.1.8",
 ]
 requires-python = ">=3.10"
 readme = "README.md"
 license = {text = "None"}
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
 
 [tool.pdm]
 distribution = false
