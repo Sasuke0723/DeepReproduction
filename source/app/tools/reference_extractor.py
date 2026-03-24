@@ -1,28 +1,62 @@
-"""文件说明：参考资料提取工具接口。
+"""Reference extraction and normalization utilities."""
 
-这个模块负责从任务输入和页面内容中整理真正值得抓取的参考链接。
-它是 knowledge 阶段的前置工具，用来减少后续抓取噪声。
-"""
+from __future__ import annotations
 
-from typing import List
+from typing import Iterable, List
+from urllib.parse import urlsplit, urlunsplit
 
 from app.schemas.task import TaskModel
 
 
 class ReferenceExtractor:
-    """参考资料提取接口。"""
+    """Collect and normalize reference URLs for the knowledge agent."""
+
+    _BLOCKED_DOMAINS = {
+        "facebook.com",
+        "twitter.com",
+        "x.com",
+        "linkedin.com",
+        "youtube.com",
+        "youtu.be",
+        "instagram.com",
+    }
 
     def collect_from_task(self, task: TaskModel) -> List[str]:
-        """从任务模型中提取候选参考链接。"""
+        """Collect task references plus the primary CVE URL."""
 
-        raise NotImplementedError
+        references = list(task.references)
+        if task.cve_url:
+            references.insert(0, task.cve_url)
+        return self.normalize(references)
 
-    def normalize(self, references: List[str]) -> List[str]:
-        """去重并标准化参考链接。"""
+    def normalize(self, references: Iterable[str]) -> List[str]:
+        """Normalize URLs and keep deterministic order."""
 
-        raise NotImplementedError
+        normalized: list[str] = []
+        seen: set[str] = set()
 
-    def filter_relevant(self, references: List[str]) -> List[str]:
-        """过滤与漏洞复现无关的参考链接。"""
+        for reference in references:
+            if not reference:
+                continue
+            cleaned = reference.strip()
+            parts = urlsplit(cleaned)
+            if parts.scheme not in {"http", "https"}:
+                continue
+            normalized_url = urlunsplit((parts.scheme, parts.netloc.lower(), parts.path, parts.query, ""))
+            if normalized_url in seen:
+                continue
+            seen.add(normalized_url)
+            normalized.append(normalized_url)
 
-        raise NotImplementedError
+        return normalized
+
+    def filter_relevant(self, references: Iterable[str]) -> List[str]:
+        """Drop obviously irrelevant or noisy domains."""
+
+        kept: list[str] = []
+        for reference in references:
+            hostname = urlsplit(reference).netloc.lower()
+            if any(hostname.endswith(domain) for domain in self._BLOCKED_DOMAINS):
+                continue
+            kept.append(reference)
+        return kept

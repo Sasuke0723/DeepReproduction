@@ -1,10 +1,18 @@
-"""文件说明：网页抓取结果模型。用于保存原始页面内容、清洗文本和基础元数据。"""
+"""Fetched page schema used by the knowledge agent."""
 
-from pydantic import BaseModel
+from typing import List, Optional
+
+from pydantic import BaseModel, Field
 
 
 class FetchedPage(BaseModel):
-    url: str
-    title: str
-    html: str
-    cleaned_text: str
+    """Normalized representation of a fetched web resource."""
+
+    url: str = Field(..., description="Fetched URL.")
+    title: str = Field(default="", description="Best-effort page title.")
+    html: str = Field(default="", description="Raw HTML or decoded text content.")
+    cleaned_text: str = Field(default="", description="Rule-cleaned text content.")
+    status_code: int = Field(default=0, description="HTTP status code.")
+    content_type: str = Field(default="", description="HTTP content type.")
+    local_path: Optional[str] = Field(default=None, description="Local file path for downloaded content.")
+    links: List[str] = Field(default_factory=list, description="Extracted child links.")

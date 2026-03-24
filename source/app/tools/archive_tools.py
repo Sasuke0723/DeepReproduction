@@ -1,52 +1,74 @@
-"""文件说明：归档处理工具接口。
+"""Archive extraction utilities for the knowledge agent."""
 
-这个模块负责处理从网页、公告页或代码托管平台下载下来的压缩附件，
-例如 `.zip`、`.tar.gz`、`.tgz` 等归档文件。
+from __future__ import annotations
 
-它的职责边界是：
-1. 判断一个文件是否是可处理的归档文件。
-2. 列出归档中的文件清单，便于上层阶段决定是否值得解压。
-3. 将归档解压到指定目录。
-4. 返回统一的解压结果，供知识阶段或构建阶段继续消费。
-
-这个模块不负责“下载文件”，下载动作仍由 `web_fetch` 或其他下载工具负责。
-"""
-
+import tarfile
+import zipfile
+from pathlib import Path
 from typing import List
 
 from pydantic import BaseModel, Field
 
 
 class ArchiveEntry(BaseModel):
-    """归档内单个文件条目。"""
+    """Single archive member."""
 
-    path: str = Field(..., description="归档内相对路径")
-    is_dir: bool = Field(default=False, description="是否为目录")
-    size: int = Field(default=0, description="文件大小")
+    path: str = Field(..., description="Archive-relative path.")
+    is_dir: bool = Field(default=False, description="Whether the member is a directory.")
+    size: int = Field(default=0, description="Uncompressed size.")
 
 
 class ArchiveExtractionResult(BaseModel):
-    """归档解压结果。"""
+    """Extraction result metadata."""
 
-    archive_path: str = Field(..., description="原始归档文件路径")
-    output_dir: str = Field(..., description="解压输出目录")
-    extracted_files: List[str] = Field(default_factory=list, description="解压出的文件列表")
+    archive_path: str = Field(..., description="Original archive path.")
+    output_dir: str = Field(..., description="Directory where the archive was extracted.")
+    extracted_files: List[str] = Field(default_factory=list, description="Extracted file paths.")
 
 
 class ArchiveTool:
-    """归档处理接口。"""
+    """Extract archive files downloaded by the knowledge agent."""
 
     def is_supported_archive(self, file_path: str) -> bool:
-        """判断当前文件是否是支持的归档格式。"""
+        """Return whether the file extension is supported."""
 
-        raise NotImplementedError
+        lowered = file_path.lower()
+        return lowered.endswith(".zip") or lowered.endswith(".tar") or lowered.endswith(".tar.gz") or lowered.endswith(".tgz")
 
     def list_entries(self, file_path: str) -> List[ArchiveEntry]:
-        """列出归档内的文件条目。"""
+        """List members in the archive."""
 
-        raise NotImplementedError
+        path = Path(file_path)
+        if path.suffix.lower() == ".zip":
+            with zipfile.ZipFile(path) as archive:
+                return [
+                    ArchiveEntry(path=info.filename, is_dir=info.is_dir(), size=info.file_size)
+                    for info in archive.infolist()
+                ]
+
+        with tarfile.open(path) as archive:
+            return [
+                ArchiveEntry(path=member.name, is_dir=member.isdir(), size=member.size)
+                for member in archive.getmembers()
+            ]
 
     def extract(self, file_path: str, output_dir: str) -> ArchiveExtractionResult:
-        """将归档文件解压到指定目录。"""
+        """Extract the archive into the target directory."""
 
-        raise NotImplementedError
+        path = Path(file_path)
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+
+        if path.suffix.lower() == ".zip":
+            with zipfile.ZipFile(path) as archive:
+                archive.extractall(output)
+        else:
+            with tarfile.open(path) as archive:
+                archive.extractall(output)
+
+        extracted_files = [str(item) for item in output.rglob("*") if item.is_file()]
+        return ArchiveExtractionResult(
+            archive_path=str(path),
+            output_dir=str(output),
+            extracted_files=extracted_files,
+        )
