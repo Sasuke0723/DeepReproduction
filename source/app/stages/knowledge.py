@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 import yaml
@@ -117,6 +118,9 @@ class KnowledgeStage:
         runtime = load_app_config().runtime
         self.max_reference_depth = runtime.knowledge_max_reference_depth
         self.max_fetch_count = runtime.knowledge_max_fetch_count
+        self.max_selected_references = runtime.knowledge_max_selected_references
+        self.max_discovered_references_per_page = runtime.knowledge_max_discovered_references_per_page
+        self.max_output_references = runtime.knowledge_max_output_references
         self.fetch_timeout_seconds = runtime.knowledge_fetch_timeout_seconds
         self.enable_llm_curation = runtime.knowledge_enable_llm_curation
         self.last_llm_status = "disabled"
@@ -221,6 +225,8 @@ class KnowledgeStage:
             return base_task, str(error)
         if not osv_payload:
             return base_task, "OSV returned an empty payload."
+        if not osv_has_commit_reference(osv_payload):
+            raise RuntimeError("OSV references did not include a commit URL; stopping because this CVE is outside the supported scope.")
         return self._merge_osv_into_task(base_task, osv_payload), None
 
     def prioritize_references(
@@ -282,7 +288,14 @@ class KnowledgeStage:
         dedup_selected = dedupe_reference_records(selected)
         selected_urls = {item.url for item in dedup_selected}
         dedup_skipped = [record for record in dedupe_reference_records(skipped) if record.url not in selected_urls]
-        return dedup_selected, dedup_skipped
+        capped_selected, overflow_skipped = truncate_reference_records(
+            dedup_selected,
+            self.max_selected_references,
+            "Dropped because it exceeded the selected reference cap.",
+        )
+        capped_urls = {item.url for item in capped_selected}
+        dedup_skipped = [record for record in dedup_skipped if record.url not in capped_urls]
+        return capped_selected, dedupe_reference_records([*dedup_skipped, *overflow_skipped])
 
     def collect_evidence(
         self,
@@ -444,7 +457,16 @@ class KnowledgeStage:
                     )
                 )
 
-        return dedupe_reference_records(discovered_selected), dedupe_reference_records(discovered_skipped)
+        dedup_selected = dedupe_reference_records(discovered_selected)
+        dedup_skipped = dedupe_reference_records(discovered_skipped)
+        capped_selected, overflow_skipped = truncate_reference_records(
+            dedup_selected,
+            self.max_discovered_references_per_page,
+            "Dropped because it exceeded the per-page discovered reference cap.",
+        )
+        capped_urls = {item.url for item in capped_selected}
+        dedup_skipped = [record for record in dedup_skipped if record.url not in capped_urls]
+        return capped_selected, dedupe_reference_records([*dedup_skipped, *overflow_skipped])
 
     def synthesize_knowledge(
         self,
@@ -458,17 +480,37 @@ class KnowledgeStage:
         summary_source = heuristic_summary_from_pages(fetched_pages)
         heuristic_vuln_type = infer_vulnerability_type(summary_source)
         heuristic_affected_files = dedupe_preserve_order(item for patch in patch_summaries for item in patch.affected_files)
+        heuristic_build_files = extract_build_files(fetched_pages, patch_summaries)
+        heuristic_build_systems = infer_build_systems(heuristic_build_files, task.language)
+        heuristic_install_commands = extract_install_commands(fetched_pages)
+        heuristic_build_commands = extract_build_commands(fetched_pages)
+        heuristic_build_hints = build_build_hints(
+            build_files=heuristic_build_files,
+            build_systems=heuristic_build_systems,
+            install_commands=heuristic_install_commands,
+            build_commands=heuristic_build_commands,
+            patch_summaries=patch_summaries,
+        )
         heuristic_reproduction_hints = build_reproduction_hints(task, fetched_pages, patch_summaries)
         heuristic_expected_stack_keywords = extract_stack_keywords(patch_summaries)
+        selected_reference_urls = limit_output_urls(
+            [record.url for record in source_registry.selected_references],
+            self.max_output_references,
+        )
         llm_result = self._try_llm_synthesis(task, fetched_pages, patch_summaries)
         if llm_result is not None:
             llm_result.summary = llm_result.summary or summary_source
             llm_result.vulnerability_type = llm_result.vulnerability_type or heuristic_vuln_type
-            llm_result.references = [record.url for record in source_registry.selected_references]
+            llm_result.references = selected_reference_urls
             llm_result.repo_url = llm_result.repo_url or task.repo_url
             llm_result.vulnerable_ref = llm_result.vulnerable_ref or task.vulnerable_ref
             llm_result.fixed_ref = llm_result.fixed_ref or task.fixed_ref
             llm_result.affected_files = llm_result.affected_files or heuristic_affected_files
+            llm_result.build_files = llm_result.build_files or heuristic_build_files
+            llm_result.build_systems = llm_result.build_systems or heuristic_build_systems
+            llm_result.install_commands = llm_result.install_commands or heuristic_install_commands
+            llm_result.build_commands = llm_result.build_commands or heuristic_build_commands
+            llm_result.build_hints = llm_result.build_hints or heuristic_build_hints
             llm_result.reproduction_hints = llm_result.reproduction_hints or heuristic_reproduction_hints
             llm_result.expected_stack_keywords = llm_result.expected_stack_keywords or heuristic_expected_stack_keywords
             llm_result.expected_error_patterns = llm_result.expected_error_patterns or default_error_patterns(
@@ -484,10 +526,15 @@ class KnowledgeStage:
             vulnerable_ref=task.vulnerable_ref,
             fixed_ref=task.fixed_ref,
             affected_files=heuristic_affected_files,
+            build_files=heuristic_build_files,
+            build_systems=heuristic_build_systems,
+            install_commands=heuristic_install_commands,
+            build_commands=heuristic_build_commands,
+            build_hints=heuristic_build_hints,
             reproduction_hints=heuristic_reproduction_hints,
             expected_error_patterns=default_error_patterns(heuristic_vuln_type),
             expected_stack_keywords=heuristic_expected_stack_keywords,
-            references=[record.url for record in source_registry.selected_references],
+            references=selected_reference_urls,
         )
 
     def _try_llm_synthesis(
@@ -542,6 +589,11 @@ class KnowledgeStage:
                         "vulnerable_ref": "string or null",
                         "fixed_ref": "string or null",
                         "affected_files": ["string"],
+                        "build_systems": ["string"],
+                        "build_files": ["string"],
+                        "install_commands": ["string"],
+                        "build_commands": ["string"],
+                        "build_hints": ["string"],
                         "reproduction_hints": ["string"],
                         "expected_error_patterns": ["string"],
                         "expected_stack_keywords": ["string"],
@@ -618,8 +670,8 @@ class KnowledgeStage:
         task_data["references"] = dedupe_preserve_order(references)
         task_data["reference_details"] = dedupe_task_references(reference_details)
 
-        language = task.language or infer_language(osv_payload)
         repo_url = task.repo_url or infer_repo_url(osv_payload)
+        language = task.language or infer_language(osv_payload) or fetch_repo_primary_language(repo_url)
         vulnerable_ref, fixed_ref = infer_git_refs(
             osv_payload,
             fallback_fixed=task.fixed_ref,
@@ -824,13 +876,105 @@ def render_cleaned_markdown(url: str, title: str, cleaned_text: str) -> str:
 
 def sanitize_filename(value: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
-    return sanitized[:180].strip("._") or "artifact"
+    sanitized = sanitized.strip("._") or "artifact"
+    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
+    if len(sanitized) > 96:
+        sanitized = sanitized[:96].rstrip("._")
+    return f"{sanitized}_{digest}"
 
 
 def ensure_empty_file(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         path.write_text("", encoding="utf-8")
+
+
+_REFERENCE_PRIORITY_ORDER = {
+    "P0": 0,
+    "P1": 1,
+    "P2": 2,
+    "P3": 3,
+}
+
+_BUILD_FILE_TO_SYSTEM = {
+    "makefile": "make",
+    "gnumakefile": "make",
+    "dockerfile": "docker",
+    "docker-compose.yml": "docker",
+    "docker-compose.yaml": "docker",
+    "cmakelists.txt": "cmake",
+    "meson.build": "meson",
+    "build.ninja": "ninja",
+    "configure": "autotools",
+    "configure.ac": "autotools",
+    "go.mod": "go",
+    "cargo.toml": "cargo",
+    "package.json": "npm",
+    "pom.xml": "maven",
+    "build.gradle": "gradle",
+    "build.gradle.kts": "gradle",
+    "gradlew": "gradle",
+    "requirements.txt": "python",
+    "setup.py": "python",
+    "pyproject.toml": "python",
+}
+
+_BUILD_FILE_HINTS = sorted(_BUILD_FILE_TO_SYSTEM.keys(), key=len, reverse=True)
+_BUILD_FILE_RE = re.compile(
+    r"(?i)(?:^|[\s`'\"(])(?P<path>[A-Za-z0-9_./-]*(?:"
+    + "|".join(re.escape(item) for item in _BUILD_FILE_HINTS)
+    + r"))(?=$|[\s`'\":),])"
+)
+
+_INSTALL_COMMAND_PREFIXES = (
+    "apt-get install",
+    "apt install",
+    "yum install",
+    "dnf install",
+    "apk add",
+    "pacman -s",
+    "brew install",
+    "pip install",
+    "python -m pip install",
+    "npm install",
+    "npm ci",
+    "yarn install",
+    "pnpm install",
+    "go mod download",
+    "cargo fetch",
+    "bundle install",
+    "composer install",
+)
+
+_BUILD_COMMAND_PREFIXES = (
+    "./configure",
+    "configure",
+    "make",
+    "cmake",
+    "cmake --build",
+    "ninja",
+    "meson setup",
+    "meson compile",
+    "go build",
+    "go test",
+    "cargo build",
+    "cargo test",
+    "python -m build",
+    "python setup.py build",
+    "python setup.py install",
+    "mvn package",
+    "mvn install",
+    "mvn test",
+    "gradle build",
+    "./gradlew build",
+    "./gradlew assemble",
+    "npm run build",
+    "npm run compile",
+    "yarn build",
+    "pnpm build",
+    "docker build",
+    "bazel build",
+)
 
 
 def dedupe_preserve_order(values: Iterable[str]) -> List[str]:
@@ -868,14 +1012,50 @@ def dedupe_task_references(records: Iterable[TaskReference]) -> List[dict]:
     return ordered
 
 
+def truncate_reference_records(
+    records: List[ReferenceRecord],
+    max_count: int,
+    drop_note: str,
+) -> tuple[List[ReferenceRecord], List[ReferenceRecord]]:
+    if max_count <= 0 or len(records) <= max_count:
+        return records, []
+
+    ordered = sorted(
+        enumerate(records),
+        key=lambda item: (
+            _REFERENCE_PRIORITY_ORDER.get(item[1].priority, 99),
+            item[1].depth,
+            item[0],
+        ),
+    )
+    kept_indexes = {index for index, _ in ordered[:max_count]}
+
+    kept: list[ReferenceRecord] = []
+    dropped: list[ReferenceRecord] = []
+    for index, record in enumerate(records):
+        if index in kept_indexes:
+            kept.append(record)
+            continue
+        dropped.append(record.model_copy(update={"selected": False, "note": f"{record.note} {drop_note}".strip()}))
+    return kept, dropped
+
+
+def limit_output_urls(urls: List[str], max_count: int) -> List[str]:
+    if max_count <= 0:
+        return []
+    return dedupe_preserve_order(urls)[:max_count]
+
+
 def score_reference(url: str, reference_type: Optional[str] = None) -> str:
     normalized_type = (reference_type or "").upper()
     if normalized_type in {"FIX", "EVIDENCE"}:
         return "P0"
 
     lowered = url.lower()
-    if ".diff" in lowered or ".patch" in lowered or "/commit/" in lowered or "/commits/" in lowered:
+    if ".diff" in lowered or ".patch" in lowered or "/-/commit/" in lowered or "/commit/" in lowered:
         return "P0"
+    if "/-/commits/" in lowered or "/commits/" in lowered:
+        return "P3"
     if "/pull/" in lowered or "/issues/" in lowered or "advisory" in lowered or "security" in lowered:
         return "P1"
     if "osv.dev" in lowered or "nvd.nist.gov" in lowered or "lists." in lowered:
@@ -921,6 +1101,17 @@ def derive_reference_variants(url: str) -> List[str]:
     variants: list[str] = []
     if "github.com" in lowered and "/commit/" in lowered and not lowered.endswith(".diff"):
         variants.append(f"{url}.diff")
+    if "/-/commit/" in lowered and not lowered.endswith(".diff") and "?" not in url:
+        variants.append(f"{url}.diff")
+    if "github.com" in lowered and "/blob/" in lowered:
+        parts = urlsplit(url)
+        path_parts = [segment for segment in parts.path.split("/") if segment]
+        if len(path_parts) >= 5:
+            owner, repo, _, ref = path_parts[:4]
+            raw_path = "/".join(path_parts[4:])
+            variants.append(f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{raw_path}")
+    if "/-/blob/" in lowered:
+        variants.append(url.replace("/-/blob/", "/-/raw/", 1))
     return variants
 
 
@@ -933,6 +1124,10 @@ def should_follow_discovered_link(parent_url: str, child_url: str) -> bool:
 
     lowered = child_url.lower()
     if any(token in lowered for token in ("/login", "/signup", "/search", "/features", "/marketplace")):
+        return False
+    if "/-/commits/" in lowered or "/commits/" in lowered:
+        return False
+    if ("/-/commit/" in lowered or "/commit/" in lowered) and child_parts.query:
         return False
 
     blocked_suffixes = (
@@ -1000,7 +1195,6 @@ def looks_like_patch(url: str, content_type: str, body: str) -> bool:
 
 
 def infer_language(osv_payload: dict) -> Optional[str]:
-    ecosystem = (((osv_payload.get("affected") or [{}])[0]).get("package") or {}).get("ecosystem", "")
     mapping = {
         "PyPI": "Python",
         "Go": "Go",
@@ -1008,7 +1202,12 @@ def infer_language(osv_payload: dict) -> Optional[str]:
         "npm": "JavaScript",
         "crates.io": "Rust",
     }
-    return mapping.get(ecosystem)
+    for affected in osv_payload.get("affected", []):
+        ecosystem = (affected.get("package") or {}).get("ecosystem", "")
+        language = mapping.get(ecosystem)
+        if language:
+            return language
+    return None
 
 
 def infer_repo_url(osv_payload: dict) -> Optional[str]:
@@ -1019,7 +1218,32 @@ def infer_repo_url(osv_payload: dict) -> Optional[str]:
             path_parts = [segment for segment in parts.path.split("/") if segment]
             if len(path_parts) >= 2:
                 return f"{parts.scheme}://{parts.netloc}/{path_parts[0]}/{path_parts[1]}.git"
+        if "/commit/" in url:
+            parts = urlsplit(url)
+            path_parts = [segment for segment in parts.path.split("/") if segment]
+            if "commit" in path_parts:
+                marker_index = path_parts.index("commit")
+                if marker_index >= 2:
+                    project_path = "/".join(path_parts[:marker_index])
+                    return f"{parts.scheme}://{parts.netloc}/{project_path}.git"
+        if "/-/commit/" in url:
+            parts = urlsplit(url)
+            path_parts = [segment for segment in parts.path.split("/") if segment]
+            if "-".strip("/") in path_parts:
+                marker_index = path_parts.index("-")
+                if marker_index >= 2:
+                    project_path = "/".join(path_parts[:marker_index])
+                    return f"{parts.scheme}://{parts.netloc}/{project_path}.git"
     return None
+
+
+def osv_has_commit_reference(osv_payload: dict) -> bool:
+    for item in osv_payload.get("references", []):
+        url = item.get("url", "")
+        lowered = url.lower()
+        if "/commit/" in lowered or "/-/commit/" in lowered:
+            return True
+    return False
 
 
 def extract_github_repo_slug(repo_url: Optional[str]) -> Optional[str]:
@@ -1039,6 +1263,65 @@ def extract_github_repo_slug(repo_url: Optional[str]) -> Optional[str]:
     if not owner or not repo:
         return None
     return f"{owner}/{repo}"
+
+
+def extract_gitlab_project_path(repo_url: Optional[str]) -> Optional[str]:
+    if not repo_url:
+        return None
+
+    parts = urlsplit(repo_url)
+    path_parts = [segment for segment in parts.path.split("/") if segment]
+    if len(path_parts) < 2:
+        return None
+
+    normalized_parts = path_parts[:-1] + [path_parts[-1].removesuffix(".git")]
+    if not normalized_parts[-1]:
+        return None
+    return "/".join(normalized_parts)
+
+
+def fetch_repo_primary_language(repo_url: Optional[str]) -> Optional[str]:
+    if not repo_url:
+        return None
+
+    parts = urlsplit(repo_url)
+    headers = {
+        "User-Agent": KnowledgeStage._USER_AGENT,
+        "Accept": "application/json",
+    }
+
+    try:
+        if "github.com" in parts.netloc.lower():
+            repo_slug = extract_github_repo_slug(repo_url)
+            if not repo_slug:
+                return None
+            request = Request(
+                f"https://api.github.com/repos/{repo_slug}/languages",
+                headers=headers,
+            )
+        else:
+            project_path = extract_gitlab_project_path(repo_url)
+            if not project_path:
+                return None
+            request = Request(
+                f"{parts.scheme}://{parts.netloc}/api/v4/projects/{quote(project_path, safe='')}/languages",
+                headers=headers,
+            )
+
+        with urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict) or not payload:
+        return None
+
+    top_language = max(
+        ((name, weight) for name, weight in payload.items() if isinstance(name, str)),
+        key=lambda item: item[1] if isinstance(item[1], (int, float)) else 0,
+        default=(None, None),
+    )[0]
+    return top_language if isinstance(top_language, str) and top_language else None
 
 
 def fetch_github_parent_ref(repo_url: Optional[str], commit_ref: Optional[str]) -> Optional[str]:
@@ -1080,7 +1363,7 @@ def infer_git_refs(
 
     for item in osv_payload.get("references", []):
         url = item.get("url", "")
-        if "github.com" in url and "/commit/" in url:
+        if "/-/commit/" in url or "/commit/" in url:
             fixed_ref = fixed_ref or url.rstrip("/").split("/")[-1].replace(".patch", "")
             break
 
@@ -1101,6 +1384,21 @@ def extract_summary_candidate(page: FetchedPage) -> str:
     text = page.cleaned_text.strip()
     if not text:
         return ""
+
+    title_candidate = normalize_summary_title(page.title or text.splitlines()[0])
+    lowered_text = text.lower()
+    noise_markers = (
+        "navigation menu",
+        "toggle navigation",
+        "search or jump to",
+        "appearance settings",
+        "loading",
+        "try again",
+        "saved searches",
+        "provide feedback",
+    )
+    if sum(marker in lowered_text for marker in noise_markers) >= 2:
+        return title_candidate[:200] if title_candidate else ""
 
     section_markers = ("Description", "Impact", "Summary", "Details")
     lines = [line.strip() for line in text.splitlines()]
@@ -1133,6 +1431,13 @@ def extract_summary_candidate(page: FetchedPage) -> str:
 
     first_paragraph = paragraphs[0] if paragraphs else ""
     return first_paragraph[:1000] if first_paragraph else ""
+
+
+def normalize_summary_title(title: str) -> str:
+    normalized = re.sub(r"\s+", " ", title).strip()
+    normalized = re.sub(r"\s*[·|-]\s*(GitHub|GitLab)$", "", normalized)
+    normalized = re.sub(r"\s*[·|-]\s*(Commits?|Issues?)$", "", normalized)
+    return normalized[:200]
 
 
 def page_summary_score(page: FetchedPage) -> int:
@@ -1215,6 +1520,130 @@ def extract_stack_keywords(patch_summaries: List[PatchSummary]) -> List[str]:
     for summary in patch_summaries:
         keywords.extend(summary.changed_functions)
     return dedupe_preserve_order(keyword for keyword in keywords if keyword)[:10]
+
+
+def normalize_build_path(path: str) -> str:
+    normalized = path.strip().strip("`'\"()[]{}<>.,:;")
+    normalized = normalized.replace("\\", "/")
+    return normalized.lstrip("./")
+
+
+def build_file_basename(path: str) -> str:
+    normalized = normalize_build_path(path)
+    return normalized.split("/")[-1].lower()
+
+
+def is_build_related_file(path: str) -> bool:
+    return build_file_basename(path) in _BUILD_FILE_TO_SYSTEM
+
+
+def extract_build_files(fetched_pages: List[FetchedPage], patch_summaries: List[PatchSummary]) -> List[str]:
+    build_files: list[str] = []
+
+    for patch in patch_summaries:
+        for path in patch.affected_files:
+            normalized = normalize_build_path(path)
+            if normalized and is_build_related_file(normalized):
+                build_files.append(normalized)
+
+    for page in fetched_pages:
+        for match in _BUILD_FILE_RE.finditer(page.cleaned_text):
+            normalized = normalize_build_path(match.group("path"))
+            if normalized and is_build_related_file(normalized):
+                build_files.append(normalized)
+
+        page_path = normalize_build_path(urlsplit(page.url).path)
+        if page_path and is_build_related_file(page_path):
+            build_files.append(page_path)
+
+    return dedupe_preserve_order(build_files)[:20]
+
+
+def infer_build_systems(build_files: List[str], language: Optional[str]) -> List[str]:
+    systems: list[str] = []
+    for path in build_files:
+        system = _BUILD_FILE_TO_SYSTEM.get(build_file_basename(path))
+        if system:
+            systems.append(system)
+
+    language_mapping = {
+        "Go": "go",
+        "Rust": "cargo",
+        "Python": "python",
+        "Java": "maven",
+        "JavaScript": "npm",
+    }
+    inferred_from_language = language_mapping.get(language or "")
+    if inferred_from_language and inferred_from_language not in systems:
+        systems.append(inferred_from_language)
+
+    return dedupe_preserve_order(systems)
+
+
+def normalize_command_candidate(candidate: str) -> str:
+    line = candidate.strip()
+    line = re.sub(r"^(?:[-*]\s+|\d+\.\s+)", "", line)
+    line = re.sub(r"^(?:\$|#|>)\s*", "", line)
+    line = re.sub(r"\s+", " ", line)
+    return line.strip("` ")
+
+
+def extract_commands_from_pages(fetched_pages: List[FetchedPage], prefixes: tuple[str, ...], limit: int = 12) -> List[str]:
+    commands: list[str] = []
+    prefix_set = tuple(prefix.lower() for prefix in prefixes)
+
+    for page in fetched_pages:
+        candidates = list(page.cleaned_text.splitlines())
+        candidates.extend(re.findall(r"`([^`\n]{3,200})`", page.cleaned_text))
+        for candidate in candidates:
+            normalized = normalize_command_candidate(candidate)
+            lowered = normalized.lower()
+            if not normalized or len(normalized) < 3:
+                continue
+            if any(lowered == prefix or lowered.startswith(prefix + " ") for prefix in prefix_set):
+                commands.append(normalized)
+            if len(dedupe_preserve_order(commands)) >= limit:
+                return dedupe_preserve_order(commands)[:limit]
+
+    return dedupe_preserve_order(commands)[:limit]
+
+
+def extract_install_commands(fetched_pages: List[FetchedPage]) -> List[str]:
+    return extract_commands_from_pages(fetched_pages, _INSTALL_COMMAND_PREFIXES, limit=10)
+
+
+def extract_build_commands(fetched_pages: List[FetchedPage]) -> List[str]:
+    return extract_commands_from_pages(fetched_pages, _BUILD_COMMAND_PREFIXES, limit=10)
+
+
+def build_build_hints(
+    build_files: List[str],
+    build_systems: List[str],
+    install_commands: List[str],
+    build_commands: List[str],
+    patch_summaries: List[PatchSummary],
+) -> List[str]:
+    hints: list[str] = []
+
+    if build_files:
+        hints.append(f"Inspect build-related files such as: {', '.join(build_files[:5])}.")
+    if build_systems:
+        hints.append(f"Detected build systems: {', '.join(build_systems[:4])}.")
+    if install_commands:
+        hints.append("The collected references include explicit dependency or environment preparation commands.")
+    if build_commands:
+        hints.append("The collected references include explicit compilation or build commands.")
+
+    changed_build_files = [
+        path
+        for patch in patch_summaries
+        for path in patch.affected_files
+        if is_build_related_file(path)
+    ]
+    if changed_build_files:
+        hints.append(f"The patch touches build-related files: {', '.join(dedupe_preserve_order(changed_build_files)[:5])}.")
+
+    return dedupe_preserve_order(hints)
 
 
 def build_reproduction_hints(task: TaskModel, fetched_pages: List[FetchedPage], patch_summaries: List[PatchSummary]) -> List[str]:
